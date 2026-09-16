@@ -21,8 +21,13 @@ async function getJson(url, { attempts = 3 } = {}) {
   throw new Error(`DefiLlama request failed: ${lastError?.message}`);
 }
 
+/** Pool index key. The market belongs in it: see fetchAavePoolIndex. */
+export const poolKey = (chainId, underlying, market) =>
+  `${chainId}:${underlying.toLowerCase()}:${market}`;
+
 /**
- * Map (chainId, underlying token) -> DefiLlama pool id for Aave v3 supply pools.
+ * Map (chainId, underlying token, market) -> DefiLlama pool id for Aave v3
+ * supply pools.
  *
  * Two traps here, both silent:
  *
@@ -30,23 +35,34 @@ async function getJson(url, { attempts = 3 } = {}) {
  *    pools, which is indistinguishable from Aave not being deployed there.
  * 2. Several Aave markets share one underlying on Ethereum: Core, "Prime
  *    Instance", "Aave Horizon Market", "Umbrella", "Legacy". They have different
- *    rates AND different aToken addresses. `poolMeta === null` is the Core
- *    market, which is the one @bgd-labs/aave-address-book's AaveV3Ethereum
- *    describes, so that is the only one we may compare against. Picking the
- *    wrong one quietly compares your position to a different market's APY.
+ *    rates AND different aToken addresses, so the market has to be part of the
+ *    key: indexing on the underlying alone compares a position against whichever
+ *    market happened to be written last, which is a plausible wrong number rather
+ *    than a visible failure. The mapping from a market to its `poolMeta` string
+ *    lives in chains.js; "Umbrella" and "Legacy" are unmapped and therefore
+ *    ignored, since neither is a market this tool reads positions from.
  */
 export async function fetchAavePoolIndex() {
   const body = await getJson("https://yields.llama.fi/pools");
   const byChainName = new Map(CHAINS.map((c) => [c.llamaYield, c.id]));
+  // (chainId, poolMeta) -> market name, built only from markets that declare one.
+  const marketByMeta = new Map();
+  for (const chain of CHAINS) {
+    for (const market of chain.markets) {
+      if (!("llamaPoolMeta" in market)) continue;
+      marketByMeta.set(`${chain.id}:${market.llamaPoolMeta}`, market.name);
+    }
+  }
   const index = new Map();
 
   for (const pool of body.data ?? []) {
     if (pool.project !== "aave-v3") continue;
     const chainId = byChainName.get(pool.chain);
     if (chainId === undefined) continue;
-    if (pool.poolMeta != null) continue; // non-Core market
+    const market = marketByMeta.get(`${chainId}:${pool.poolMeta ?? null}`);
+    if (market === undefined) continue; // a market we do not read positions from
     for (const token of pool.underlyingTokens ?? []) {
-      const key = `${chainId}:${token.toLowerCase()}`;
+      const key = poolKey(chainId, token, market);
       const existing = index.get(key);
       // Deterministic tie-break: deepest market wins.
       if (!existing || (pool.tvlUsd ?? 0) > (existing.tvlUsd ?? 0)) {

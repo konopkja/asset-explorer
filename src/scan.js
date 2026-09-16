@@ -15,7 +15,7 @@ import {
   interestSeries,
   toUnits,
 } from "./metrics.js";
-import { fetchAavePoolIndex, fetchApyHistory, fetchPrices, lookupPrice } from "./llama.js";
+import { fetchAavePoolIndex, fetchApyHistory, fetchPrices, lookupPrice, poolKey } from "./llama.js";
 import {
   balanceOfBatch,
   scaledBalanceOfBatch,
@@ -24,10 +24,8 @@ import {
 } from "./rpc.js";
 
 /**
- * Scan orchestration, shared by the CLI and the browser build.
- *
- * Everything environment-specific is injected as a `client`, so this file has no
- * opinion about where the data comes from or whether a key is involved:
+ * Scan orchestration. Everything environment-specific is injected as a `client`,
+ * so this file has no opinion about where the data comes from:
  *
  *   getPositionLogs(chainId, { aToken, user, fromBlock, txHashes }) -> logs
  *   getTokenBalances(chainId, address)                -> balance rows
@@ -36,9 +34,8 @@ import {
  *   reservesFor(chainId)                              -> reserve list
  *   requestCount()                                    -> number
  *
- * The CLI's client reads the Pro host with a key and caches sweeps to disk; the
- * browser's reads the keyless public instances. The accounting comes out
- * identical because it is literally the same code.
+ * The shipped client is src/client-web.js, reading the keyless public explorer
+ * instances from the browser.
  */
 
 /**
@@ -160,7 +157,7 @@ export async function scanChain(client, chainId, user, poolIndex, { onProgress =
     const dated = ledger.filter((e) => e.timestamp);
     const firstTs = dated.length ? dated[0].timestamp : null;
 
-    const pool = poolIndex.get(`${chainId}:${reserve.underlying}`) ?? null;
+    const pool = poolIndex.get(poolKey(chainId, reserve.underlying, reserve.market)) ?? null;
     let apyHistory = [];
     if (pool) {
       try {
@@ -176,6 +173,7 @@ export async function scanChain(client, chainId, user, poolIndex, { onProgress =
     positions.push({
       chainId,
       chainName: chain.name,
+      market: reserve.market,
       symbol: reserve.symbol,
       decimals: reserve.decimals,
       underlying: reserve.underlying,
@@ -305,6 +303,14 @@ export async function scanAddress(
       position.priceConfidence = info?.confidence ?? null;
       position.balanceUsd = info?.price != null ? position.balance * info.price : null;
       position.interestUsd = info?.price != null ? position.interest * info.price : null;
+      // A withdrawal that empties a position routinely leaves a few wei behind
+      // (29 wei of aUSDC, on the position that prompted this), which is a
+      // non-zero balance and so reads as open while displaying 0. Anything worth
+      // under a cent is an exited position, and the report treats it as closed.
+      // Left as a separate flag rather than folded into isOpen, because isOpen is
+      // a fact about the chain and this is a judgement about presentation.
+      position.isDust =
+        position.isOpen && position.balanceUsd != null && position.balanceUsd < 0.01;
       position.monthlyEstimateUsd =
         info?.price != null && position.monthlyEstimate != null
           ? position.monthlyEstimate * info.price

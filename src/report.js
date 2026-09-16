@@ -158,7 +158,7 @@ export const METHODOLOGY_HTML = `
       <li><strong>Gas is not counted.</strong> Your net return after fees is lower than shown.</li>
       <li><strong>Borrow-side interest is out of scope.</strong> Supply positions only.</li>
       <li><strong>Pool rate history begins 2023-02-06.</strong> An older window shows the comparison as unavailable rather than guessing.</li>
-      <li><strong>Only the Aave v3 Core market</strong> is scanned. The Prime, Horizon, Lido and EtherFi instances are separate markets and are not included. Aave v2 is not included.</li>
+      <li><strong>Aave v2 is not included</strong>, and neither is any market outside the set compiled into this page. On Ethereum that set is Core, Prime, Horizon and EtherFi; every other chain has Core only. Each market is compared against its own pool rate, never another market's, and a market DefiLlama does not publish rates for shows the comparison as unavailable.</li>
     </ul>
 `;
 
@@ -190,6 +190,18 @@ export const RENDER_SCRIPT = String.raw`
     if (html != null) n.innerHTML = html;
     return n;
   };
+  /**
+   * "Open" for display means money still at work. A position emptied by a
+   * withdrawal keeps a few wei of aToken dust, which is a real non-zero balance
+   * on the chain and would otherwise get a full card reading a balance of 0.
+   */
+  const isLive = (p) => p.isOpen && !p.isDust;
+
+  // Ethereum has several Aave markets. Naming the market matters only when it is
+  // not the Core one, which is what an unqualified "Ethereum USDC" means.
+  const label = (p) => p.chainName + " &middot; " +
+    (p.market && p.market !== "Core" ? p.market + " &middot; " : "") + p.symbol;
+
   const SCAN = { 1: "https://etherscan.io", 10: "https://optimistic.etherscan.io",
     8453: "https://basescan.org", 42161: "https://arbiscan.io",
     59144: "https://lineascan.build" };
@@ -319,7 +331,7 @@ export const RENDER_SCRIPT = String.raw`
   function positionCard(p) {
     const card = el("div", "card");
     const head = el("div", "card-head");
-    head.appendChild(el("div", null, "<h3>" + p.chainName + " &middot; " + p.symbol + "</h3>"));
+    head.appendChild(el("div", null, "<h3>" + label(p) + "</h3>"));
     const badges = el("div", null);
     badges.style.cssText = "display:flex;gap:8px;flex-wrap:wrap";
     if (p.eventsComplete === true) {
@@ -328,7 +340,7 @@ export const RENDER_SCRIPT = String.raw`
         + "so no deposit or withdrawal is missing.";
       badges.appendChild(v);
     }
-    badges.appendChild(el("span", "badge" + (p.isOpen ? " open" : ""), p.isOpen ? "open" : "closed"));
+    badges.appendChild(el("span", "badge" + (isLive(p) ? " open" : ""), isLive(p) ? "open" : "closed"));
     head.appendChild(badges);
     card.appendChild(head);
 
@@ -544,7 +556,8 @@ export const RENDER_SCRIPT = String.raw`
       "<table><thead><tr><th>Chain</th><th>Asset</th><th>Earned</th>" +
       "<th>Opened</th><th>Closed</th></tr></thead><tbody>" +
       shown.map(r =>
-        "<tr><td>" + r.p.chainName + '</td><td class="name"' +
+        "<tr><td>" + r.p.chainName + (r.p.market && r.p.market !== "Core" ? " " + r.p.market : "") +
+        '</td><td class="name"' +
         (r.p.interestIsNegative || r.p.eventsComplete === false
           ? ' title="The events found for this position do not reconcile against the contract, ' +
             'so the amount earned is unreliable."> ' + r.p.symbol + " !"
@@ -636,9 +649,9 @@ export const RENDER_SCRIPT = String.raw`
     }
     // Open positions get the full card. An exited one gets a line in the strip
     // below them, so the page leads with money that is still at work.
-    positions.filter(p => p.isOpen).forEach(p => positionsHost.appendChild(positionCard(p)));
+    positions.filter(isLive).forEach(p => positionsHost.appendChild(positionCard(p)));
 
-    const closed = positions.filter(p => !p.isOpen);
+    const closed = positions.filter(p => !isLive(p));
     if (closed.length) {
       const strip = closedStrip(closed);
       if (strip) positionsHost.appendChild(strip);
@@ -659,7 +672,7 @@ export function renderReport(result) {
   ).replace(/</g, "\\u003c");
 
   const positions = result.chains.flatMap((c) => c.positions);
-  const openCount = positions.filter((p) => p.isOpen).length;
+  const openCount = positions.filter((p) => p.isOpen && !p.isDust).length;
   const asOf = new Date(result.asOf * 1000).toISOString().slice(0, 16).replace("T", " ");
 
   return `<!doctype html>

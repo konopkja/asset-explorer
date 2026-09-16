@@ -17,6 +17,24 @@
  *
  * `scan` is the human-facing explorer used for transaction links in the report.
  *
+ * `markets` are the Aave v3 instances on the chain. Only Ethereum has more than
+ * one, and they are genuinely separate markets: the same underlying has a
+ * different aToken and a different rate in each, so a position must be compared
+ * against its OWN market or the comparison is meaningless.
+ *
+ *   book           the @bgd-labs/aave-address-book export, which is the source of
+ *                  every address.
+ *   llamaPoolMeta  the `poolMeta` string DefiLlama stamps on that market's pools,
+ *                  with `null` meaning the Core market (DefiLlama leaves poolMeta
+ *                  unset there). The key is ABSENT for a market DefiLlama does not
+ *                  list at all, which makes the pool comparison render as
+ *                  unavailable instead of silently borrowing another market's rate.
+ *
+ * Verified 2026-09-16 against yields.llama.fi/pools: the address book's
+ * `AaveV3EthereumLido` is what DefiLlama calls "Prime Instance" and what Aave's
+ * own UI now calls Prime (8 of its 9 reserves matched by symbol); Horizon matched
+ * 8 of 9; `AaveV3EthereumEtherFi` has no aave-v3 pools on DefiLlama at all.
+ *
  * `logTimestamps: false` marks an instance whose /transactions/{hash}/logs
  * response omits `block_timestamp`. Every time-weighted metric drops undated
  * entries, so those chains take the timestamp from the transfer sweep instead;
@@ -31,7 +49,13 @@ export const CHAINS = [
   {
     id: 1,
     name: "Ethereum",
-    market: "AaveV3Ethereum",
+    markets: [
+      { name: "Core", book: "AaveV3Ethereum", llamaPoolMeta: null },
+      { name: "Prime", book: "AaveV3EthereumLido", llamaPoolMeta: "Prime Instance" },
+      { name: "Horizon", book: "AaveV3EthereumHorizon", llamaPoolMeta: "Aave Horizon Market" },
+      // Not listed on DefiLlama, so positions here get no pool benchmark.
+      { name: "EtherFi", book: "AaveV3EthereumEtherFi" },
+    ],
     llamaPrice: "ethereum",
     rpc: "https://ethereum-rpc.publicnode.com",
     llamaYield: "Ethereum",
@@ -41,7 +65,7 @@ export const CHAINS = [
   {
     id: 10,
     name: "Optimism",
-    market: "AaveV3Optimism",
+    markets: [{ name: "Core", book: "AaveV3Optimism", llamaPoolMeta: null }],
     llamaPrice: "optimism",
     rpc: "https://mainnet.optimism.io",
     llamaYield: "OP Mainnet",
@@ -51,7 +75,7 @@ export const CHAINS = [
   {
     id: 8453,
     name: "Base",
-    market: "AaveV3Base",
+    markets: [{ name: "Core", book: "AaveV3Base", llamaPoolMeta: null }],
     llamaPrice: "base",
     rpc: "https://mainnet.base.org",
     llamaYield: "Base",
@@ -61,7 +85,7 @@ export const CHAINS = [
   {
     id: 42161,
     name: "Arbitrum",
-    market: "AaveV3Arbitrum",
+    markets: [{ name: "Core", book: "AaveV3Arbitrum", llamaPoolMeta: null }],
     llamaPrice: "arbitrum",
     rpc: "https://arb1.arbitrum.io/rpc",
     llamaYield: "Arbitrum",
@@ -71,7 +95,7 @@ export const CHAINS = [
   {
     id: 59144,
     name: "Linea",
-    market: "AaveV3Linea",
+    markets: [{ name: "Core", book: "AaveV3Linea", llamaPoolMeta: null }],
     llamaPrice: "linea",
     rpc: "https://rpc.linea.build",
     llamaYield: "Linea",

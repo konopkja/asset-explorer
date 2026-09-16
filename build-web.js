@@ -94,6 +94,7 @@ const bundle = pieces
 // data. This is also what keeps the app keyless: no runtime reserve discovery.
 const RESERVES = Object.fromEntries(CHAINS.map((c) => [c.id, reservesFor(c.id)]));
 const reserveCount = Object.values(RESERVES).reduce((n, r) => n + r.length, 0);
+const marketCount = CHAINS.reduce((n, c) => n + c.markets.length, 0);
 
 const html = `<!doctype html>
 <html lang="en">
@@ -165,8 +166,9 @@ const html = `<!doctype html>
         (Optimism's is <code>explorer.optimism.io</code>, Linea's is
         <code>api-explorer.linea.build</code>).</li>
       <li>Pool rate history and token prices: DefiLlama.</li>
-      <li>${reserveCount} Aave v3 Core reserves across ${CHAINS.length} chains are compiled into this page
-        from <code>@bgd-labs/aave-address-book</code>, so nothing has to be discovered at runtime.</li>
+      <li>${reserveCount} Aave v3 reserves across ${CHAINS.length} chains and ${marketCount} market
+        instances are compiled into this page from <code>@bgd-labs/aave-address-book</code>, so nothing
+        has to be discovered at runtime.</li>
       <li><strong>Previously held</strong> lists positions you have exited, sized by the most
         principal each ever held at today's price, so an asset that has since moved a long way
         in price can cross or miss the $10 line on today's value rather than the value while
@@ -260,7 +262,7 @@ ${bundle}
 
       bar.classList.remove("active");
       const positions = result.chains.reduce((a, c) => a.concat(c.positions), []);
-      const open = positions.filter((p) => p.isOpen).length;
+      const open = positions.filter((p) => p.isOpen && !p.isDust).length;
       setStatus("");
       metaEl.innerHTML =
         '<span class="mono">' + (resolved.ens ? resolved.ens + " &middot; " : "") +

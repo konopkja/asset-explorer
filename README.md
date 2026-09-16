@@ -3,9 +3,10 @@
 **What did your capital actually earn, and what did the pool pay while you held it?**
 
 Reconstructs your Aave v3 supply positions and token balances from onchain history across
-Ethereum, Optimism, Base, Arbitrum and Linea, then reports the number no wallet or protocol
-UI shows: your own money-weighted annualised return, next to the rate the pool really paid
-over exactly your holding window.
+Ethereum, Optimism, Base, Arbitrum and Linea — including Ethereum's separate Core, Prime,
+Horizon and EtherFi markets — then reports the number no wallet or protocol UI shows: your
+own money-weighted annualised return, next to the rate the pool really paid over exactly
+your holding window.
 
 The whole thing runs in your browser. No key, no server, no wallet connect, nothing sent
 anywhere except the public block explorers and DefiLlama.
@@ -17,8 +18,8 @@ npm install && npm run build   # writes web/index.html
 open web/index.html            # or double-click it
 ```
 
-One self-contained HTML file, ~118 KB, 121 Aave v3 Core reserves baked in. Type an address
-or ENS name, pick chains, scan. It works from `file://` too: the public Blockscout
+One self-contained HTML file, ~133 KB, 143 Aave v3 reserves across 8 market instances baked
+in. Type an address or ENS name, pick chains, scan. It works from `file://` too: the public Blockscout
 instances serve `access-control-allow-origin: *`, which allows a null origin.
 
 `web/index.html#vitalik.eth` scans that name on load, so a link is shareable.
@@ -65,6 +66,12 @@ one that has fallen can miss it. The count of positions below the line is always
 nothing is silently dropped. A row whose events do not reconcile against the contract is
 marked `!`, because its earned amount is then unreliable.
 
+A withdrawal that empties a position routinely leaves a few wei of aToken behind (29 wei of
+aUSDC, on the position that prompted this), which is a non-zero balance and so reads as open
+while displaying a balance of 0. Anything worth **under a cent** therefore counts as exited
+and lands in the strip. `isOpen` in the payload stays a fact about the chain; the dust
+judgement is a separate `isDust` flag.
+
 ## How it works
 
 One primitive, read many ways: a dated cashflow ledger per position.
@@ -82,7 +89,7 @@ render        one renderer -> the live page, or a standalone dark HTML file
 
 ```
 src/
-  chains.js      5 chains, their explorer APIs, DefiLlama's names for them
+  chains.js      5 chains: explorer APIs, market instances, DefiLlama's names
   decode.js      zero-dep aToken event decoding, pinned topic hashes
   ledger.js      events -> classified, dated principal/interest ledger
   metrics.js     XIRR, pool TWR, utilisation, exact balance series
@@ -95,8 +102,9 @@ src/
 build-web.js     inlines the shared modules into one HTML file
 ```
 
-Scanning all 121 reserves blind would cost hundreds of log queries. Discovery-first turns a
-real address into roughly 30 requests.
+Scanning all 143 reserves blind would cost hundreds of log queries. Discovery-first turns a
+real address into roughly 30 requests, and adding a market costs requests only for someone
+who actually used it.
 
 ### Why the events come per transaction, not per range
 
@@ -211,7 +219,7 @@ that looked exactly like a missing event.
 | `reputation` field | Says `ok` for a token with 100bn supply, no price and no market. **Not a spam filter.** The price floor does that work. |
 | Aave debt tokens | DefiLlama prices them at a **negative** price (`-0.9997`). Left in a holdings list they net silently against real assets. |
 | DefiLlama chain name | Optimism is `OP Mainnet`. Filtering on `"Optimism"` returns zero pools, which reads as "not deployed". Linea is plain `Linea`. |
-| One underlying, many pools | Ethereum USDC matches Core, Prime, Horizon and Umbrella, with different rates *and* different aTokens. `poolMeta === null` is Core. |
+| One underlying, many pools | Ethereum USDC exists in Core, Prime, Horizon and Umbrella with different rates *and* different aTokens — 3.56%, 3.19% and 5.69% base on the same day. So the pool index is keyed on (chain, underlying, **market**); keying on the underlying alone silently benchmarks a position against whichever market was written last. DefiLlama's `poolMeta` is `null` for Core, `"Prime Instance"` for the address book's `AaveV3EthereumLido`, `"Aave Horizon Market"` for Horizon, and absent entirely for EtherFi, which therefore gets no benchmark rather than a borrowed one. |
 | SVG `preserveAspectRatio="none"` | Stretches the viewBox and distorts text. Measure the container and draw at its width. |
 
 ## Verified
@@ -222,6 +230,10 @@ that looked exactly like a missing event.
 - Linea, scanned in a browser against a real address: 2 positions, both reconciled, dated
   and charted — USDC over 226 days at your 4.09% against a pool paying 3.86%, WETH over 344
   days at 1.82% against 1.57%, in 25 requests / 12s.
+- Market routing, on a real Horizon position: the card benchmarks it at the pool's 5.69%,
+  which is Horizon USDC's `apyBase`, not Core's 3.56% or Prime's 3.19% on the same day. The
+  Prime and EtherFi mappings are matched by reserve symbol against DefiLlama, not yet by a
+  live position.
 - ENS resolves in the browser (`vitalik.eth`, `nick.eth`, a raw address, and a nonexistent
   name, which errors clearly rather than resolving to a token).
 - Rendered and inspected at 1280px and 400px: no horizontal overflow, tables in their own
@@ -230,9 +242,11 @@ that looked exactly like a missing event.
 
 ## Scope
 
-Supply-side Aave v3 **Core** market only. Not included: borrow-side interest, Aave v2, the
-Prime / Horizon / Lido / EtherFi instances, reward tokens, gas, and transfers between
-wallets you both control (those look like deposits and will skew your APY). Pool rate
+Supply side only, across the markets compiled into the page: Core, Prime, Horizon and
+EtherFi on Ethereum, Core alone on the other four chains. Not included: borrow-side
+interest, Aave v2, DefiLlama's "Umbrella" and "Legacy" pools (neither is a market positions
+are read from), reward tokens, gas, and transfers between wallets you both control (those
+look like deposits and will skew your APY). Pool rate
 history begins 2023-02-06; earlier windows render the comparison as unavailable rather than
 guessing. Linea's `wrsETH` reserve has no DefiLlama pool, so a position in it gets no pool
 benchmark. Each limit is restated in the report footer.
