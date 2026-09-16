@@ -162,12 +162,15 @@ const html = `<!doctype html>
     <h2>Where the data comes from</h2>
     <ul>
       <li>Event history, balances and ENS: the public Blockscout instance for each chain
-        (Optimism's is <code>explorer.optimism.io</code>).</li>
+        (Optimism's is <code>explorer.optimism.io</code>, Linea's is
+        <code>api-explorer.linea.build</code>).</li>
       <li>Pool rate history and token prices: DefiLlama.</li>
       <li>${reserveCount} Aave v3 Core reserves across ${CHAINS.length} chains are compiled into this page
         from <code>@bgd-labs/aave-address-book</code>, so nothing has to be discovered at runtime.</li>
-      <li>The ledger and rate maths in this page are the same source as the command-line
-        version, inlined at build time rather than reimplemented.</li>
+      <li><strong>Previously held</strong> lists positions you have exited, sized by the most
+        principal each ever held at today's price, so an asset that has since moved a long way
+        in price can cross or miss the $10 line on today's value rather than the value while
+        you held it.</li>
     </ul>
   </footer>
 </div>

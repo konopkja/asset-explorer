@@ -479,6 +479,84 @@ export const RENDER_SCRIPT = String.raw`
     return card;
   }
 
+  /**
+   * A position you have since exited earns one line, not a card.
+   *
+   * The scan already finds closed positions (the transfer sweep sees an aToken
+   * that was touched even when the balance is now zero), and dust dominates them:
+   * a 2 OP position held for an afternoon reads exactly like a real one if both
+   * get the same card. So the strip is thresholded on the largest principal the
+   * position ever held, valued at TODAY's price rather than the price while it was
+   * open. That is an approximation, and it is the honest one available without a
+   * historical price call per position: it can promote an asset that has since
+   * appreciated and demote one that has fallen.
+   */
+  const CLOSED_MIN_USD = 10;
+
+  function peakPrincipal(p) {
+    let running = 0, peak = 0;
+    for (const e of p.ledger) {
+      running += e.principalDelta;
+      if (running > peak) peak = running;
+    }
+    return peak;
+  }
+
+  function closedStrip(closed) {
+    const sized = closed.map(p => {
+      const peak = peakPrincipal(p);
+      const dated = p.ledger.filter(e => e.timestamp);
+      return {
+        p: p,
+        peakUsd: p.priceUsd != null ? peak * p.priceUsd : null,
+        opened: dated.length ? dated[0].timestamp : null,
+        // The last event on a position with no balance left is the exit.
+        closed: dated.length ? dated[dated.length - 1].timestamp : null,
+      };
+    });
+
+    // An unpriced asset cannot be judged against the threshold, so it is shown
+    // rather than silently dropped.
+    const shown = sized.filter(r => r.peakUsd == null || r.peakUsd >= CLOSED_MIN_USD)
+      .sort((a, b) => (b.closed || 0) - (a.closed || 0));
+    const hidden = sized.length - shown.length;
+
+    const hiddenNote = hidden
+      ? hidden + " smaller closed position" + (hidden === 1 ? "" : "s") +
+        " not shown (never held $" + CLOSED_MIN_USD + ")."
+      : "";
+
+    if (shown.length === 0) {
+      return hiddenNote ? el("p", "chart-note", hiddenNote) : null;
+    }
+
+    const suspect = shown.some(r => r.p.interestIsNegative || r.p.eventsComplete === false);
+    const card = el("div", "card");
+    card.appendChild(el("div", "chart-title", "Previously held"));
+    card.appendChild(el("div", "chart-note",
+      "Positions you have since exited, in token terms. " +
+      "Sized by the most principal each one ever held, at today's price." +
+      (suspect ? " A row marked ! has incomplete history, so its amount is unreliable." : "") +
+      (hiddenNote ? " " + hiddenNote : "")));
+
+    const scroll = el("div", "scroll");
+    scroll.innerHTML =
+      "<table><thead><tr><th>Chain</th><th>Asset</th><th>Earned</th>" +
+      "<th>Opened</th><th>Closed</th></tr></thead><tbody>" +
+      shown.map(r =>
+        "<tr><td>" + r.p.chainName + '</td><td class="name"' +
+        (r.p.interestIsNegative || r.p.eventsComplete === false
+          ? ' title="The events found for this position do not reconcile against the contract, ' +
+            'so the amount earned is unreliable."> ' + r.p.symbol + " !"
+          : "> " + r.p.symbol) + "</td>" +
+        '<td class="mono ' + (r.p.interest >= 0 ? "pos" : "neg") + '">' +
+        (r.p.interest >= 0 ? "+" : "") + num(r.p.interest) + " " + r.p.symbol + "</td>" +
+        "<td>" + day(r.opened) + "</td><td>" + day(r.closed) + "</td></tr>").join("") +
+      "</tbody></table>";
+    card.appendChild(scroll);
+    return card;
+  }
+
   function holdingsCard(DATA) {
     const totals = DATA.chains.map(c => ({
       name: c.name,
@@ -556,7 +634,15 @@ export const RENDER_SCRIPT = String.raw`
         "No Aave v3 Core-market positions found on the scanned chains. " +
         "Positions in the Prime, Horizon, Lido or EtherFi instances, or in Aave v2, are not scanned."));
     }
-    positions.forEach(p => positionsHost.appendChild(positionCard(p)));
+    // Open positions get the full card. An exited one gets a line in the strip
+    // below them, so the page leads with money that is still at work.
+    positions.filter(p => p.isOpen).forEach(p => positionsHost.appendChild(positionCard(p)));
+
+    const closed = positions.filter(p => !p.isOpen);
+    if (closed.length) {
+      const strip = closedStrip(closed);
+      if (strip) positionsHost.appendChild(strip);
+    }
 
     holdingsHost.appendChild(el("h2", null, "Wallet holdings"));
     holdingsHost.appendChild(holdingsCard(DATA));

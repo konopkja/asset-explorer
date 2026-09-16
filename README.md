@@ -50,6 +50,21 @@ to hold — every credential-free endpoint is called directly from the visitor's
 Plus wallet holdings per chain, spam-filtered, and any open Aave debt (flagged, not
 accounted for).
 
+### Positions you have since exited
+
+The transfer sweep sees an aToken that was *ever* touched, so closed positions come back
+from the same scan with no extra request. They get one line each in a **Previously held**
+strip under the open cards — chain, asset, interest earned in token terms, opened, closed —
+rather than a card, because dust dominates them: a 2 OP position held for an afternoon
+otherwise reads exactly like a real one.
+
+The strip is thresholded at **$10 of peak principal**, valued at **today's** price. That is
+an approximation, and it is the honest one available without a historical price call per
+position: an asset that has since appreciated can cross the line on value it never had, and
+one that has fallen can miss it. The count of positions below the line is always printed, so
+nothing is silently dropped. A row whose events do not reconcile against the contract is
+marked `!`, because its earned amount is then unreliable.
+
 ## How it works
 
 One primitive, read many ways: a dated cashflow ledger per position.
