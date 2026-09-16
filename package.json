@@ -1,0 +1,17 @@
+{
+  "name": "asset-explorer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "What did my capital actually earn? A keyless, client-side Aave v3 yield ledger.",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build-web.js",
+    "build:web": "node build-web.js",
+    "dev": "node build-web.js && python3 -m http.server 8931 --directory web",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@bgd-labs/aave-address-book": "^4.44.22"
+  }
+}
