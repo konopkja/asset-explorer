@@ -106,3 +106,10 @@ export const CHAINS = [
 ];
 
 export const chainById = (id) => CHAINS.find((c) => c.id === id);
+
+/**
+ * Every chain here is ETH-native, and DefiLlama prices ether under a coingecko
+ * id rather than a per-chain token address. Cost basis needs it because a swap
+ * funded with ETH has no ERC-20 leg to price.
+ */
+export const NATIVE_COIN = "coingecko:ethereum";

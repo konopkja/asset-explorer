@@ -183,6 +183,16 @@ export const RENDER_SCRIPT = String.raw`
     const r = Math.abs(p) < 0.5 * Math.pow(10, -digits) ? 0 : p;
     return r.toFixed(digits) + "%";
   };
+  /**
+   * A unit price can be a fraction of a cent, where two decimals prints "$0" and
+   * says nothing: BNKR at $0.000295 read as "$0 each, break even at $0". Below a
+   * cent, show three significant figures instead.
+   */
+  const usdPrice = (v) => {
+    if (v == null || !isFinite(v)) return "—";
+    if (v === 0 || Math.abs(v) >= 0.01) return usd(v);
+    return (v < 0 ? "-$" : "$") + Math.abs(v).toPrecision(3);
+  };
   const day = (ts) => ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "—";
   const el = (tag, cls, html) => {
     const n = document.createElement(tag);
@@ -618,19 +628,126 @@ export const RENDER_SCRIPT = String.raw`
     const det = el("details");
     det.appendChild(el("summary", null, "Every priced holding"));
     const scroll = el("div", "scroll");
-    const rows = DATA.chains.reduce((acc, c) =>
-      acc.concat(c.holdings.filter(h => h.kept).map(h => Object.assign({}, h, { chain: c.name }))), [])
-      .sort((a, b) => (b.valueUsd || 0) - (a.valueUsd || 0));
+    const rows = keptHoldings(DATA);
     scroll.innerHTML =
-      "<table><thead><tr><th>Token</th><th>Chain</th><th>Amount</th><th>Price</th><th>Value</th><th>Confidence</th></tr></thead><tbody>" +
-      rows.map(h =>
-        '<tr><td class="name">' + (h.symbol || "?") + "</td><td>" + h.chain + "</td>" +
-        "<td>" + num(h.amount, 4) + "</td><td>" + usd(h.priceUsd) + "</td><td>" + usd(h.valueUsd) + "</td>" +
-        "<td>" + (h.confidence != null ? h.confidence.toFixed(2) : "—") + "</td></tr>").join("") +
+      "<table><thead><tr><th>Token</th><th>Chain</th><th>Amount</th><th>Price</th><th>Value</th>" +
+      "<th>Cost</th><th>P&amp;L</th><th>Break-even</th><th>Confidence</th></tr></thead><tbody>" +
+      rows.map(h => {
+        const b = h.basis || {};
+        const gain = b.gainUsd;
+        return '<tr><td class="name">' + (h.symbol || "?") + "</td><td>" + h.chain + "</td>" +
+        "<td>" + num(h.amount, 4) + "</td><td>" + usdPrice(h.priceUsd) + "</td><td>" + usd(h.valueUsd) + "</td>" +
+        "<td>" + (b.costUsd != null ? usd(b.costUsd) : "—") + "</td>" +
+        '<td class="' + (gain == null ? "" : gain >= 0 ? "pos" : "neg") + '">' +
+        (gain == null ? "—" : (gain >= 0 ? "+" : "") + usd(gain) +
+          (b.gainPct != null ? " (" + (b.gainPct >= 0 ? "+" : "") + pctS(b.gainPct, 1) + ")" : "")) + "</td>" +
+        "<td>" + usdPrice(b.breakEvenUsd) + "</td>" +
+        "<td>" + (h.confidence != null ? h.confidence.toFixed(2) : "—") + "</td></tr>";
+      }).join("") +
       "</tbody></table>";
     det.appendChild(scroll);
     sum.appendChild(det);
     return sum;
+  }
+
+  const keptHoldings = (DATA) => DATA.chains.reduce((acc, c) =>
+    acc.concat(c.holdings.filter(h => h.kept).map(h => Object.assign({}, h, { chain: c.name }))), [])
+    .sort((a, b) => (b.valueUsd || 0) - (a.valueUsd || 0));
+
+  /**
+   * What you paid, reconstructed from your own transfers.
+   *
+   * One expandable block per token rather than a row nested in the holdings
+   * table: a trade has several legs and a sale has a matched cost, neither of
+   * which fits a cell.
+   */
+  function basisCard(DATA) {
+    const rows = keptHoldings(DATA).filter(h => h.basis &&
+      ((h.basis.trades || []).length || (h.basis.sales || []).length));
+    if (rows.length === 0) return null;
+
+    const known = rows.filter(h => h.basis.gainUsd != null);
+    const cost = known.reduce((s, h) => s + h.basis.costUsd, 0);
+    const gain = known.reduce((s, h) => s + h.basis.gainUsd, 0);
+    const anyTruncated = rows.some(h => h.basis.truncated);
+    const anyUnpriced = rows.some(h => h.basis.qtyUnpriced > 0);
+
+    const card = el("div", "card");
+    card.appendChild(el("div", "chart-title", "What you paid for what you hold"));
+    card.appendChild(el("div", "chart-note",
+      (known.length
+        ? "Across " + known.length + " token" + (known.length === 1 ? "" : "s") +
+          " with a reconstructed basis: " + usd(cost) + " paid, worth " + usd(cost + gain) +
+          " now, " + (gain >= 0 ? "up " : "down ") + usd(Math.abs(gain)) + ". "
+        : "") +
+      "Read from your own transfers: in each transaction, whatever left the wallet is what " +
+      "you paid for whatever arrived. Gas is not included, so break-even is slightly optimistic." +
+      (anyUnpriced ? " Tokens that arrived with nothing on the other side (an airdrop, a claim, " +
+        "an exchange withdrawal or your own second wallet) have no onchain cost and are counted " +
+        "separately rather than as free profit." : "") +
+      (anyTruncated ? " History was truncated on at least one chain, so the oldest trades may be " +
+        "missing." : "")));
+
+    rows.forEach(h => {
+      const b = h.basis;
+      const det = el("details");
+      const bits = [];
+      if ((b.trades || []).length) bits.push(b.trades.length + (b.trades.length === 1 ? " buy" : " buys"));
+      if ((b.sales || []).length) bits.push(b.sales.length + (b.sales.length === 1 ? " sale" : " sales"));
+      // The count, not a quantity: the summary sits next to "2 buys" and a
+      // quantity there reads as the amount still held, which it is not.
+      if (b.received) bits.push(b.received.count + (b.received.count === 1 ? " receipt" : " receipts"));
+      det.appendChild(el("summary", null,
+        h.symbol + " on " + h.chain + " &middot; " + bits.join(", ") +
+        (b.gainUsd != null
+          ? ' &middot; <span class="' + (b.gainUsd >= 0 ? "pos" : "neg") + '">' +
+            (b.gainUsd >= 0 ? "+" : "") + usd(b.gainUsd) + "</span>"
+          : " &middot; cost unknown")));
+
+      const scroll = el("div", "scroll");
+      const lines = [];
+      (b.trades || []).forEach(t => lines.push(
+        "<tr><td>" + day(t.timestamp) + '</td><td class="name">bought</td>' +
+        '<td class="pos">+' + num(t.qty, 4) + " " + h.symbol + "</td>" +
+        "<td>" + t.paid.map(p => num(p.qty, 4) + " " + p.symbol).join(" + ") + "</td>" +
+        "<td>" + (t.costUsd != null ? usd(t.costUsd) : "—") + "</td>" +
+        "<td>" + usdPrice(t.unitCostUsd) + "</td>" +
+        '<td><a href="' + txUrl(h.chainId, t.txHash) + '" target="_blank" rel="noopener">' +
+        (t.txHash ? t.txHash.slice(0, 10) : "") + "</a></td></tr>"));
+      (b.sales || []).forEach(t => lines.push(
+        "<tr><td>" + day(t.timestamp) + '</td><td class="name">sold</td>' +
+        '<td class="neg">-' + num(t.qty, 4) + " " + h.symbol + "</td>" +
+        "<td>" + (t.received.length ? t.received.map(p => num(p.qty, 4) + " " + p.symbol).join(" + ") : "—") + "</td>" +
+        "<td>" + (t.proceedsUsd != null ? usd(t.proceedsUsd) : "—") + "</td>" +
+        '<td class="' + (t.gainUsd == null ? "" : t.gainUsd >= 0 ? "pos" : "neg") + '">' +
+        (t.gainUsd == null ? "—" : (t.gainUsd >= 0 ? "+" : "") + usd(t.gainUsd)) + "</td>" +
+        '<td><a href="' + txUrl(h.chainId, t.txHash) + '" target="_blank" rel="noopener">' +
+        (t.txHash ? t.txHash.slice(0, 10) : "") + "</a></td></tr>"));
+      if (b.received) lines.push(
+        "<tr><td>" + day(b.received.firstTs) + '</td><td class="name">received</td>' +
+        "<td>+" + num(b.received.qty, 4) + " " + h.symbol + "</td>" +
+        "<td>nothing paid" + (b.received.count > 1 ? ", over " + b.received.count + " transfers" : "") + "</td>" +
+        "<td>—</td><td>—</td><td></td></tr>");
+
+      scroll.innerHTML =
+        "<table><thead><tr><th>Date</th><th>Action</th><th>Amount</th><th>Other side</th>" +
+        "<th>Cost / proceeds</th><th>Per unit / gain</th><th>Tx</th></tr></thead><tbody>" +
+        lines.join("") + "</tbody></table>";
+      det.appendChild(scroll);
+
+      if (b.qtyPriced > 0) {
+        det.appendChild(el("div", "chart-note",
+          "Holding " + num(h.amount, 4) + " " + h.symbol + ". " +
+          num(b.qtyPriced, 4) + " of it cost " + usd(b.costUsd) + " (" + usdPrice(b.avgCostUsd) + " each), " +
+          "so you break even at " + usdPrice(b.breakEvenUsd) + " per " + h.symbol + "." +
+          (b.qtyUnpriced > 0
+            ? " The other " + num(b.qtyUnpriced, 4) + " arrived with no onchain price and is left out of that."
+            : "")));
+      }
+      card.appendChild(det);
+    });
+
+    return card;
   }
 
   function render(DATA, hosts) {
@@ -659,6 +776,12 @@ export const RENDER_SCRIPT = String.raw`
 
     holdingsHost.appendChild(el("h2", null, "Wallet holdings"));
     holdingsHost.appendChild(holdingsCard(DATA));
+
+    const basis = basisCard(DATA);
+    if (basis) {
+      holdingsHost.appendChild(el("h2", null, "Cost basis"));
+      holdingsHost.appendChild(basis);
+    }
   }
 
   window.YieldLedger = { render: render };

@@ -28,6 +28,7 @@ const MODULES = [
   "decode.js",
   "ledger.js",
   "metrics.js",
+  "basis.js",
   "llama.js",
   "rpc.js",
   "scan.js",

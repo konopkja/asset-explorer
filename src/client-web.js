@@ -230,6 +230,78 @@ async function getTokenTransfers(chainId, address, { maxPages = 60 } = {}) {
   return { transfers: merged, truncated: stillTruncated, pages };
 }
 
+/**
+ * Every transaction in which ETH itself moved in or out of the wallet.
+ *
+ * Cost basis reads a swap from the wallet's net position change, and a swap
+ * funded with ETH has no ERC-20 leg on the paying side, so without this an
+ * ETH-funded buy looks like a gift. Two paginated address endpoints cover it:
+ * `transactions` carries the value the wallet sent directly, and
+ * `internal-transactions` carries ETH a contract sent back, which is how a sale
+ * for ETH arrives.
+ *
+ * Paginated per ADDRESS rather than fetched per transaction. The per-transaction
+ * route is what the public instances rate-limit into the ground: a probe that
+ * fetched roughly a hundred single transactions took a 429 and stayed limited for
+ * minutes, while a paged address sweep of the same history is a handful of calls.
+ */
+async function getNativeMoves(chainId, address, { maxPages = 8 } = {}) {
+  const owner = address.toLowerCase();
+  const moves = new Map();
+  let truncated = false;
+
+  const walk = async (path, sign, fixed = {}) => {
+    let params = null;
+    for (let page = 0; ; page += 1) {
+      if (page >= maxPages) {
+        truncated = true;
+        return;
+      }
+      const query = new URLSearchParams(fixed);
+      for (const [key, value] of Object.entries(params ?? {})) {
+        if (value != null) query.set(key, String(value));
+      }
+      let body;
+      try {
+        body = await request(`${host(chainId)}/api/v2/addresses/${address}/${path}?${query}`);
+      } catch {
+        // Native legs are an enrichment: losing them costs cost-basis coverage on
+        // ETH-funded trades, which the report labels, and nothing else.
+        truncated = true;
+        return;
+      }
+      for (const item of body?.items ?? []) {
+        let raw;
+        try {
+          raw = BigInt(item.value ?? 0);
+        } catch {
+          continue;
+        }
+        if (raw === 0n) continue;
+        const hash = item.transaction_hash ?? item.hash;
+        if (!hash) continue;
+        const from = (item.from?.hash ?? "").toLowerCase();
+        const to = (item.to?.hash ?? "").toLowerCase();
+        // `sign` fixes the direction for the outgoing-transaction list, where the
+        // wallet is always the sender; internal rows are read from their own ends.
+        let delta = 0n;
+        if (sign !== 0) delta = raw * BigInt(sign);
+        else if (to === owner && from !== owner) delta = raw;
+        else if (from === owner && to !== owner) delta = -raw;
+        if (delta === 0n) continue;
+        moves.set(hash, (moves.get(hash) ?? 0n) + delta);
+      }
+      if (!body?.next_page_params) return;
+      params = body.next_page_params;
+    }
+  };
+
+  // filter=from is the wallet's own sends, so every row is ETH leaving.
+  await walk("transactions", -1, { filter: "from" });
+  await walk("internal-transactions", 0);
+  return { moves, truncated };
+}
+
 async function getNativeBalance(chainId, address) {
   const body = await request(`${host(chainId)}/api/v2/addresses/${address}`);
   return BigInt(body?.coin_balance ?? 0);
@@ -271,6 +343,7 @@ export const webClient = {
   getPositionLogs,
   getTokenBalances,
   getTokenTransfers,
+  getNativeMoves,
   getNativeBalance,
   reservesFor,
   requestCount: () => requests,

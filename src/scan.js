@@ -15,7 +15,16 @@ import {
   interestSeries,
   toUnits,
 } from "./metrics.js";
-import { fetchAavePoolIndex, fetchApyHistory, fetchPrices, lookupPrice, poolKey } from "./llama.js";
+import {
+  fetchAavePoolIndex,
+  fetchApyHistory,
+  fetchPrices,
+  fetchHistoricalPrices,
+  lookupPrice,
+  lookupHistorical,
+  poolKey,
+} from "./llama.js";
+import { transactionDeltas, lotsForToken, matchFifo, summarise } from "./basis.js";
 import {
   balanceOfBatch,
   scaledBalanceOfBatch,
@@ -95,6 +104,12 @@ export async function scanChain(client, chainId, user, poolIndex, { onProgress =
 
   onProgress(`${chain.name}: reading balances`);
   const balanceRows = await client.getTokenBalances(chainId, user);
+
+  // ETH legs of swaps, which are not ERC-20 transfers and so are invisible to the
+  // sweep. Only cost basis needs them, and a client may not offer them at all.
+  const native = client.getNativeMoves
+    ? await client.getNativeMoves(chainId, user)
+    : { moves: new Map(), truncated: true };
   const balanceByToken = new Map(balanceRows.map((row) => [row.address, row]));
 
   // A reserve is a candidate if its aToken was ever transferred (covers closed
@@ -246,6 +261,10 @@ export async function scanChain(client, chainId, user, poolIndex, { onProgress =
     balanceRows,
     nativeRaw: await client.getNativeBalance(chainId, user),
     sweep: { truncated: sweep.truncated, pages: sweep.pages, transfers: sweep.transfers.length },
+    // Intermediates for the cost-basis pass in scanAddress, deleted before the
+    // result is returned: both are Maps and neither belongs in the payload.
+    transfers: sweep.transfers,
+    nativeMoves: native,
   };
 }
 
@@ -362,11 +381,127 @@ export async function scanAddress(
       .sort((a, b) => (b.valueUsd ?? 0) - (a.valueUsd ?? 0));
     result.hiddenHoldings = result.holdings.filter((h) => !h.kept).length;
 
+    // Cost basis, from the wallet's own history: see src/basis.js. Only holdings
+    // that survived the spam filter are worth reconstructing, and the whole pass
+    // costs no explorer requests at all because the sweep already holds both legs
+    // of every swap.
+    const byTx = transactionDeltas(result.transfers ?? [], user);
+    for (const holding of result.holdings) {
+      if (!holding.kept) continue;
+      holding.lots = lotsForToken(byTx, holding.address, {
+        nativeDeltas: result.nativeMoves?.moves ?? new Map(),
+      });
+    }
+
     // balanceRows carries BigInts and is only an intermediate. Dropping it keeps
     // the payload JSON-serialisable and roughly halves the report size.
     delete result.balanceRows;
     result.nativeBalance = toUnits(result.nativeRaw, 18);
     delete result.nativeRaw;
+  }
+
+  // One batched historical-price call for every leg of every trade, across all
+  // chains at once. Paid legs give the cost of a lot, received legs the proceeds
+  // of a sale.
+  onProgress("pricing your trades");
+  const legRequests = [];
+  for (const result of results) {
+    for (const holding of result.holdings ?? []) {
+      if (!holding.lots) continue;
+      for (const lot of holding.lots.acquisitions) {
+        for (const leg of lot.paid) {
+          legRequests.push({ chainId: result.chainId, address: leg.token, timestamp: lot.timestamp });
+        }
+      }
+      for (const lot of holding.lots.disposals) {
+        for (const leg of lot.received) {
+          legRequests.push({ chainId: result.chainId, address: leg.token, timestamp: lot.timestamp });
+        }
+      }
+    }
+  }
+  let historical = new Map();
+  try {
+    historical = await fetchHistoricalPrices(legRequests);
+  } catch {
+    historical = new Map(); // every lot then reports an unknown basis, and says so
+  }
+
+  const valueLegs = (chainId, legs, timestamp) => {
+    let total = 0;
+    const priced = [];
+    for (const leg of legs) {
+      const info = lookupHistorical(historical, chainId, leg.token, timestamp);
+      const usd = info?.price != null ? leg.qty * info.price : null;
+      priced.push({ symbol: leg.symbol, qty: leg.qty, priceUsd: info?.price ?? null, valueUsd: usd });
+      if (usd == null) total = null;
+      else if (total != null) total += usd;
+    }
+    return { total: legs.length ? total : null, priced };
+  };
+
+  for (const result of results) {
+    for (const holding of result.holdings ?? []) {
+      const lots = holding.lots;
+      delete holding.lots;
+      if (!lots) continue;
+
+      const acquisitions = lots.acquisitions.map((lot) => {
+        const { total, priced } = valueLegs(result.chainId, lot.paid, lot.timestamp);
+        return { ...lot, paid: priced, costUsd: total };
+      });
+      const disposals = lots.disposals.map((lot) => {
+        const { total, priced } = valueLegs(result.chainId, lot.received, lot.timestamp);
+        return { ...lot, received: priced, proceedsUsd: total };
+      });
+
+      const { open, realized } = matchFifo(acquisitions, disposals);
+      const summary = summarise(open, {
+        balance: holding.amount,
+        priceUsd: holding.priceUsd,
+      });
+
+      // An acquisition with no counter-leg is an airdrop, a claim, an exchange
+      // withdrawal or your own other wallet. There can be hundreds of them on a
+      // token that pays holders, and listing each one would bury the trades that
+      // actually have a price, so they collapse into one line.
+      const trades = acquisitions.filter((a) => a.paid.length > 0);
+      const gifts = acquisitions.filter((a) => a.paid.length === 0);
+
+      holding.basis = {
+        ...summary,
+        // Cost basis can only be as complete as the sweep that fed it.
+        truncated: result.sweep.truncated || !!result.nativeMoves?.truncated,
+        trades: trades.map((t) => ({
+          timestamp: t.timestamp,
+          txHash: t.txHash,
+          qty: t.qty,
+          paid: t.paid,
+          costUsd: t.costUsd,
+          unitCostUsd: t.costUsd != null && t.qty > 0 ? t.costUsd / t.qty : null,
+        })),
+        received: gifts.length
+          ? {
+              count: gifts.length,
+              qty: gifts.reduce((sum, g) => sum + g.qty, 0),
+              firstTs: gifts[0].timestamp ?? null,
+              lastTs: gifts[gifts.length - 1].timestamp ?? null,
+            }
+          : null,
+        sales: realized.map((r) => ({
+          timestamp: r.timestamp,
+          txHash: r.txHash,
+          qty: r.qty,
+          received: r.received,
+          proceedsUsd: r.proceedsUsd,
+          costUsd: r.costUsd,
+          gainUsd: r.gainUsd,
+          unmatchedQty: r.unmatchedQty,
+        })),
+      };
+    }
+    delete result.transfers;
+    delete result.nativeMoves;
   }
 
   return {

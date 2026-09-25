@@ -241,6 +241,16 @@ const RESERVES = {"1":[{"chainId":1,"market":"Core","symbol":"WETH","decimals":1
     const r = Math.abs(p) < 0.5 * Math.pow(10, -digits) ? 0 : p;
     return r.toFixed(digits) + "%";
   };
+  /**
+   * A unit price can be a fraction of a cent, where two decimals prints "$0" and
+   * says nothing: BNKR at $0.000295 read as "$0 each, break even at $0". Below a
+   * cent, show three significant figures instead.
+   */
+  const usdPrice = (v) => {
+    if (v == null || !isFinite(v)) return "—";
+    if (v === 0 || Math.abs(v) >= 0.01) return usd(v);
+    return (v < 0 ? "-$" : "$") + Math.abs(v).toPrecision(3);
+  };
   const day = (ts) => ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "—";
   const el = (tag, cls, html) => {
     const n = document.createElement(tag);
@@ -676,19 +686,126 @@ const RESERVES = {"1":[{"chainId":1,"market":"Core","symbol":"WETH","decimals":1
     const det = el("details");
     det.appendChild(el("summary", null, "Every priced holding"));
     const scroll = el("div", "scroll");
-    const rows = DATA.chains.reduce((acc, c) =>
-      acc.concat(c.holdings.filter(h => h.kept).map(h => Object.assign({}, h, { chain: c.name }))), [])
-      .sort((a, b) => (b.valueUsd || 0) - (a.valueUsd || 0));
+    const rows = keptHoldings(DATA);
     scroll.innerHTML =
-      "<table><thead><tr><th>Token</th><th>Chain</th><th>Amount</th><th>Price</th><th>Value</th><th>Confidence</th></tr></thead><tbody>" +
-      rows.map(h =>
-        '<tr><td class="name">' + (h.symbol || "?") + "</td><td>" + h.chain + "</td>" +
-        "<td>" + num(h.amount, 4) + "</td><td>" + usd(h.priceUsd) + "</td><td>" + usd(h.valueUsd) + "</td>" +
-        "<td>" + (h.confidence != null ? h.confidence.toFixed(2) : "—") + "</td></tr>").join("") +
+      "<table><thead><tr><th>Token</th><th>Chain</th><th>Amount</th><th>Price</th><th>Value</th>" +
+      "<th>Cost</th><th>P&amp;L</th><th>Break-even</th><th>Confidence</th></tr></thead><tbody>" +
+      rows.map(h => {
+        const b = h.basis || {};
+        const gain = b.gainUsd;
+        return '<tr><td class="name">' + (h.symbol || "?") + "</td><td>" + h.chain + "</td>" +
+        "<td>" + num(h.amount, 4) + "</td><td>" + usdPrice(h.priceUsd) + "</td><td>" + usd(h.valueUsd) + "</td>" +
+        "<td>" + (b.costUsd != null ? usd(b.costUsd) : "—") + "</td>" +
+        '<td class="' + (gain == null ? "" : gain >= 0 ? "pos" : "neg") + '">' +
+        (gain == null ? "—" : (gain >= 0 ? "+" : "") + usd(gain) +
+          (b.gainPct != null ? " (" + (b.gainPct >= 0 ? "+" : "") + pctS(b.gainPct, 1) + ")" : "")) + "</td>" +
+        "<td>" + usdPrice(b.breakEvenUsd) + "</td>" +
+        "<td>" + (h.confidence != null ? h.confidence.toFixed(2) : "—") + "</td></tr>";
+      }).join("") +
       "</tbody></table>";
     det.appendChild(scroll);
     sum.appendChild(det);
     return sum;
+  }
+
+  const keptHoldings = (DATA) => DATA.chains.reduce((acc, c) =>
+    acc.concat(c.holdings.filter(h => h.kept).map(h => Object.assign({}, h, { chain: c.name }))), [])
+    .sort((a, b) => (b.valueUsd || 0) - (a.valueUsd || 0));
+
+  /**
+   * What you paid, reconstructed from your own transfers.
+   *
+   * One expandable block per token rather than a row nested in the holdings
+   * table: a trade has several legs and a sale has a matched cost, neither of
+   * which fits a cell.
+   */
+  function basisCard(DATA) {
+    const rows = keptHoldings(DATA).filter(h => h.basis &&
+      ((h.basis.trades || []).length || (h.basis.sales || []).length));
+    if (rows.length === 0) return null;
+
+    const known = rows.filter(h => h.basis.gainUsd != null);
+    const cost = known.reduce((s, h) => s + h.basis.costUsd, 0);
+    const gain = known.reduce((s, h) => s + h.basis.gainUsd, 0);
+    const anyTruncated = rows.some(h => h.basis.truncated);
+    const anyUnpriced = rows.some(h => h.basis.qtyUnpriced > 0);
+
+    const card = el("div", "card");
+    card.appendChild(el("div", "chart-title", "What you paid for what you hold"));
+    card.appendChild(el("div", "chart-note",
+      (known.length
+        ? "Across " + known.length + " token" + (known.length === 1 ? "" : "s") +
+          " with a reconstructed basis: " + usd(cost) + " paid, worth " + usd(cost + gain) +
+          " now, " + (gain >= 0 ? "up " : "down ") + usd(Math.abs(gain)) + ". "
+        : "") +
+      "Read from your own transfers: in each transaction, whatever left the wallet is what " +
+      "you paid for whatever arrived. Gas is not included, so break-even is slightly optimistic." +
+      (anyUnpriced ? " Tokens that arrived with nothing on the other side (an airdrop, a claim, " +
+        "an exchange withdrawal or your own second wallet) have no onchain cost and are counted " +
+        "separately rather than as free profit." : "") +
+      (anyTruncated ? " History was truncated on at least one chain, so the oldest trades may be " +
+        "missing." : "")));
+
+    rows.forEach(h => {
+      const b = h.basis;
+      const det = el("details");
+      const bits = [];
+      if ((b.trades || []).length) bits.push(b.trades.length + (b.trades.length === 1 ? " buy" : " buys"));
+      if ((b.sales || []).length) bits.push(b.sales.length + (b.sales.length === 1 ? " sale" : " sales"));
+      // The count, not a quantity: the summary sits next to "2 buys" and a
+      // quantity there reads as the amount still held, which it is not.
+      if (b.received) bits.push(b.received.count + (b.received.count === 1 ? " receipt" : " receipts"));
+      det.appendChild(el("summary", null,
+        h.symbol + " on " + h.chain + " &middot; " + bits.join(", ") +
+        (b.gainUsd != null
+          ? ' &middot; <span class="' + (b.gainUsd >= 0 ? "pos" : "neg") + '">' +
+            (b.gainUsd >= 0 ? "+" : "") + usd(b.gainUsd) + "</span>"
+          : " &middot; cost unknown")));
+
+      const scroll = el("div", "scroll");
+      const lines = [];
+      (b.trades || []).forEach(t => lines.push(
+        "<tr><td>" + day(t.timestamp) + '</td><td class="name">bought</td>' +
+        '<td class="pos">+' + num(t.qty, 4) + " " + h.symbol + "</td>" +
+        "<td>" + t.paid.map(p => num(p.qty, 4) + " " + p.symbol).join(" + ") + "</td>" +
+        "<td>" + (t.costUsd != null ? usd(t.costUsd) : "—") + "</td>" +
+        "<td>" + usdPrice(t.unitCostUsd) + "</td>" +
+        '<td><a href="' + txUrl(h.chainId, t.txHash) + '" target="_blank" rel="noopener">' +
+        (t.txHash ? t.txHash.slice(0, 10) : "") + "</a></td></tr>"));
+      (b.sales || []).forEach(t => lines.push(
+        "<tr><td>" + day(t.timestamp) + '</td><td class="name">sold</td>' +
+        '<td class="neg">-' + num(t.qty, 4) + " " + h.symbol + "</td>" +
+        "<td>" + (t.received.length ? t.received.map(p => num(p.qty, 4) + " " + p.symbol).join(" + ") : "—") + "</td>" +
+        "<td>" + (t.proceedsUsd != null ? usd(t.proceedsUsd) : "—") + "</td>" +
+        '<td class="' + (t.gainUsd == null ? "" : t.gainUsd >= 0 ? "pos" : "neg") + '">' +
+        (t.gainUsd == null ? "—" : (t.gainUsd >= 0 ? "+" : "") + usd(t.gainUsd)) + "</td>" +
+        '<td><a href="' + txUrl(h.chainId, t.txHash) + '" target="_blank" rel="noopener">' +
+        (t.txHash ? t.txHash.slice(0, 10) : "") + "</a></td></tr>"));
+      if (b.received) lines.push(
+        "<tr><td>" + day(b.received.firstTs) + '</td><td class="name">received</td>' +
+        "<td>+" + num(b.received.qty, 4) + " " + h.symbol + "</td>" +
+        "<td>nothing paid" + (b.received.count > 1 ? ", over " + b.received.count + " transfers" : "") + "</td>" +
+        "<td>—</td><td>—</td><td></td></tr>");
+
+      scroll.innerHTML =
+        "<table><thead><tr><th>Date</th><th>Action</th><th>Amount</th><th>Other side</th>" +
+        "<th>Cost / proceeds</th><th>Per unit / gain</th><th>Tx</th></tr></thead><tbody>" +
+        lines.join("") + "</tbody></table>";
+      det.appendChild(scroll);
+
+      if (b.qtyPriced > 0) {
+        det.appendChild(el("div", "chart-note",
+          "Holding " + num(h.amount, 4) + " " + h.symbol + ". " +
+          num(b.qtyPriced, 4) + " of it cost " + usd(b.costUsd) + " (" + usdPrice(b.avgCostUsd) + " each), " +
+          "so you break even at " + usdPrice(b.breakEvenUsd) + " per " + h.symbol + "." +
+          (b.qtyUnpriced > 0
+            ? " The other " + num(b.qtyUnpriced, 4) + " arrived with no onchain price and is left out of that."
+            : "")));
+      }
+      card.appendChild(det);
+    });
+
+    return card;
   }
 
   function render(DATA, hosts) {
@@ -717,6 +834,12 @@ const RESERVES = {"1":[{"chainId":1,"market":"Core","symbol":"WETH","decimals":1
 
     holdingsHost.appendChild(el("h2", null, "Wallet holdings"));
     holdingsHost.appendChild(holdingsCard(DATA));
+
+    const basis = basisCard(DATA);
+    if (basis) {
+      holdingsHost.appendChild(el("h2", null, "Cost basis"));
+      holdingsHost.appendChild(basis);
+    }
   }
 
   window.YieldLedger = { render: render };
@@ -832,6 +955,13 @@ const CHAINS = [
 ];
 
 const chainById = (id) => CHAINS.find((c) => c.id === id);
+
+/**
+ * Every chain here is ETH-native, and DefiLlama prices ether under a coingecko
+ * id rather than a per-chain token address. Cost basis needs it because a swap
+ * funded with ETH has no ERC-20 leg to price.
+ */
+const NATIVE_COIN = "coingecko:ethereum";
 
 
 // ---- src/decode.js ---------------------------------------------------
@@ -1474,6 +1604,219 @@ const pct = (r, digits = 2) => {
 };
 
 
+// ---- src/basis.js ----------------------------------------------------
+/**
+ * What did you pay for the tokens you are holding?
+ *
+ * The answer is already in the wallet's own transfer history and needs no DEX
+ * knowledge at all. A swap, whoever routed it, is one transaction in which your
+ * balance of one token falls and your balance of another rises. So the trade is
+ * read from your net position change per transaction: whatever left the wallet is
+ * what you paid, whatever arrived is what you bought. That works identically for
+ * Uniswap, CoW, an aggregator, an OTC transfer or a contract nobody has decoded,
+ * because none of them can move your tokens without a transfer.
+ *
+ * Every function here is pure and integer-based on the quantity side. Pricing is
+ * injected by the caller, because it is I/O and because a lot whose price cannot
+ * be found must stay visibly unpriced rather than quietly becoming zero.
+ *
+ * What this deliberately cannot see:
+ *
+ *   - An acquisition with nothing on the other side: an airdrop, a claim, an
+ *     exchange withdrawal, or a transfer from your own second wallet. There is no
+ *     onchain price for any of those, so they are counted as quantity with an
+ *     UNKNOWN basis and are never averaged in as if they were free.
+ *   - Native ETH legs, which are not ERC-20 transfers. The caller can supply them
+ *     per transaction via `nativeDeltas`; without that, an ETH-funded buy looks
+ *     like an acquisition with no counter-leg and is reported as unpriced.
+ *   - Gas, so a break-even price is slightly optimistic.
+ */
+
+/**
+ * Group a wallet's transfers into one net position change per transaction.
+ *
+ * Netting is what makes this robust: a router that passes a token through the
+ * wallet twice, or a transfer to yourself, nets to zero and disappears, so only
+ * the real change of ownership survives.
+ */
+function transactionDeltas(transfers, user) {
+  const owner = user.toLowerCase();
+  const byTx = new Map();
+
+  for (const t of transfers) {
+    if (!t.txHash) continue;
+    const inbound = t.to === owner;
+    const outbound = t.from === owner;
+    if (inbound === outbound) continue; // neither side, or a self-transfer
+
+    let tx = byTx.get(t.txHash);
+    if (!tx) {
+      tx = { txHash: t.txHash, timestamp: t.timestamp ?? null, blockNumber: t.blockNumber, deltas: new Map() };
+      byTx.set(t.txHash, tx);
+    }
+    // The sweep can carry several rows for one transaction; the earliest stamp
+    // is the transaction's own.
+    if (t.timestamp != null && (tx.timestamp == null || t.timestamp < tx.timestamp)) {
+      tx.timestamp = t.timestamp;
+    }
+
+    const existing = tx.deltas.get(t.token) ?? {
+      token: t.token,
+      symbol: t.symbol,
+      decimals: t.decimals,
+      raw: 0n,
+    };
+    existing.raw += inbound ? t.raw : -t.raw;
+    tx.deltas.set(t.token, existing);
+  }
+
+  return byTx;
+}
+
+const units = (raw, decimals) => Number(raw) / 10 ** decimals;
+
+/**
+ * Split one token's history into acquisitions and disposals, each carrying the
+ * other side of its transaction.
+ *
+ * `nativeDeltas` is an optional Map of txHash -> native amount in wei, signed the
+ * same way: negative when the wallet spent ETH. It is what turns an ETH-funded
+ * buy from "no counter-leg" into a priced lot.
+ */
+function lotsForToken(byTx, token, { nativeDeltas = new Map(), nativeSymbol = "ETH" } = {}) {
+  const acquisitions = [];
+  const disposals = [];
+
+  for (const tx of byTx.values()) {
+    const moved = tx.deltas.get(token);
+    const nativeRaw = nativeDeltas.get(tx.txHash) ?? 0n;
+    if (!moved || moved.raw === 0n) continue;
+
+    const others = [...tx.deltas.values()].filter((d) => d.token !== token && d.raw !== 0n);
+    if (nativeRaw !== 0n) {
+      others.push({ token: null, symbol: nativeSymbol, decimals: 18, raw: nativeRaw, isNative: true });
+    }
+    const side = (sign) =>
+      others
+        .filter((d) => (sign > 0 ? d.raw > 0n : d.raw < 0n))
+        .map((d) => ({
+          token: d.token,
+          symbol: d.symbol,
+          decimals: d.decimals,
+          isNative: !!d.isNative,
+          qty: units(d.raw < 0n ? -d.raw : d.raw, d.decimals),
+        }));
+
+    const lot = {
+      txHash: tx.txHash,
+      timestamp: tx.timestamp,
+      blockNumber: tx.blockNumber,
+      qty: units(moved.raw < 0n ? -moved.raw : moved.raw, moved.decimals),
+    };
+
+    if (moved.raw > 0n) acquisitions.push({ ...lot, paid: side(-1) });
+    else disposals.push({ ...lot, received: side(1) });
+  }
+
+  // Undated entries sort last rather than pretending to be the oldest, which
+  // would corrupt FIFO order.
+  const byTime = (a, b) => (a.timestamp ?? Infinity) - (b.timestamp ?? Infinity);
+  return { acquisitions: acquisitions.sort(byTime), disposals: disposals.sort(byTime) };
+}
+
+/**
+ * Consume acquisitions oldest-first against disposals.
+ *
+ * FIFO rather than average cost because it is what a tax authority and every
+ * exchange statement assume, and because it keeps each remaining lot traceable to
+ * the transaction that created it.
+ *
+ * A lot with `costUsd == null` (an airdrop, or a leg with no price) stays
+ * unpriced all the way through: consuming it produces realised quantity with no
+ * realised gain, rather than a gain equal to the whole proceeds.
+ */
+function matchFifo(acquisitions, disposals) {
+  const open = acquisitions.map((a) => ({ ...a, left: a.qty }));
+  const realized = [];
+
+  for (const disposal of disposals) {
+    let toMatch = disposal.qty;
+    const consumed = [];
+    for (const lot of open) {
+      if (toMatch <= 1e-18) break;
+      if (lot.left <= 1e-18) continue;
+      const take = Math.min(lot.left, toMatch);
+      lot.left -= take;
+      toMatch -= take;
+      consumed.push({
+        txHash: lot.txHash,
+        timestamp: lot.timestamp,
+        qty: take,
+        costUsd: lot.costUsd == null ? null : (lot.costUsd * take) / lot.qty,
+      });
+    }
+    const costKnown = consumed.length > 0 && consumed.every((c) => c.costUsd != null);
+    const cost = costKnown ? consumed.reduce((s, c) => s + c.costUsd, 0) : null;
+    realized.push({
+      txHash: disposal.txHash,
+      timestamp: disposal.timestamp,
+      qty: disposal.qty,
+      // Quantity sold that no acquisition accounts for: history is incomplete.
+      unmatchedQty: toMatch > 1e-12 ? toMatch : 0,
+      proceedsUsd: disposal.proceedsUsd ?? null,
+      costUsd: cost,
+      gainUsd: cost != null && disposal.proceedsUsd != null ? disposal.proceedsUsd - cost : null,
+      received: disposal.received,
+    });
+  }
+
+  return { open: open.filter((lot) => lot.left > 1e-18), realized };
+}
+
+/**
+ * Roll the open lots up into the figures a holder actually asks for: what did
+ * this cost me, what is it worth, and what price do I need to break even.
+ *
+ * Quantity with an unknown basis is reported separately and excluded from the
+ * average. Mixing it in would understate the average cost and overstate the gain,
+ * which is the exact error this whole module exists to avoid.
+ */
+function summarise(open, { balance = null, priceUsd = null } = {}) {
+  let qtyPriced = 0;
+  let costUsd = 0;
+  let qtyUnpriced = 0;
+
+  for (const lot of open) {
+    if (lot.costUsd == null) qtyUnpriced += lot.left;
+    else {
+      qtyPriced += lot.left;
+      costUsd += (lot.costUsd * lot.left) / lot.qty;
+    }
+  }
+
+  const heldQty = balance ?? qtyPriced + qtyUnpriced;
+  const valueUsd = priceUsd != null ? heldQty * priceUsd : null;
+  const pricedValueUsd = priceUsd != null ? qtyPriced * priceUsd : null;
+
+  return {
+    qtyPriced,
+    qtyUnpriced,
+    costUsd: qtyPriced > 0 ? costUsd : null,
+    avgCostUsd: qtyPriced > 0 ? costUsd / qtyPriced : null,
+    // Break-even is the average cost: the price at which the priced lots return
+    // exactly what they cost. Gas is not in it.
+    breakEvenUsd: qtyPriced > 0 ? costUsd / qtyPriced : null,
+    valueUsd,
+    // Gain is computed only over the lots that have a cost, so an airdropped
+    // remainder cannot inflate it.
+    gainUsd: qtyPriced > 0 && pricedValueUsd != null ? pricedValueUsd - costUsd : null,
+    gainPct: qtyPriced > 0 && pricedValueUsd != null && costUsd > 0
+      ? pricedValueUsd / costUsd - 1
+      : null,
+  };
+}
+
+
 // ---- src/llama.js ----------------------------------------------------
 
 const HEADERS = { "User-Agent": "curl/8.7.1", Accept: "application/json" };
@@ -1605,6 +1948,79 @@ async function fetchPrices(tokens) {
 
 const lookupPrice = (prices, chainId, address) =>
   prices.get(priceKey(chainId, address).toLowerCase()) ?? null;
+
+/**
+ * Historical prices for many (token, moment) pairs in ONE request.
+ *
+ * Cost basis needs a price at the moment of every trade, and the obvious
+ * endpoint (`prices/historical/{ts}/{coins}`) takes one timestamp, so a wallet
+ * with forty trades on forty days would pay forty round trips. `batchHistorical`
+ * takes a map of coin -> list of timestamps instead, which collapses the whole
+ * report into a single call.
+ *
+ * DefiLlama answers with the nearest price it has rather than the exact instant,
+ * so the reply is matched back by proximity and anything outside the search
+ * window is dropped rather than snapped to a distant price.
+ */
+const SEARCH_WIDTH = 600; // seconds either side, matching the endpoint's default
+
+const historicalKey = (coin, timestamp) => `${coin.toLowerCase()}@${timestamp}`;
+
+/** `address: null` means the chain's native coin. */
+const coinId = (chainId, address) => {
+  if (address == null) return NATIVE_COIN;
+  const chain = CHAINS.find((c) => c.id === chainId);
+  return `${chain?.llamaPrice ?? "ethereum"}:${address.toLowerCase()}`;
+};
+
+async function fetchHistoricalPrices(requests) {
+  const wanted = new Map(); // coin -> Set of timestamps
+  for (const r of requests) {
+    if (r.timestamp == null) continue;
+    const coin = coinId(r.chainId, r.address);
+    if (!wanted.has(coin)) wanted.set(coin, new Set());
+    wanted.get(coin).add(r.timestamp);
+  }
+  const out = new Map();
+  if (wanted.size === 0) return out;
+
+  // Chunked so one enormous URL cannot fail the whole report.
+  const coins = [...wanted.entries()];
+  for (let i = 0; i < coins.length; i += 25) {
+    const batch = Object.fromEntries(
+      coins.slice(i, i + 25).map(([coin, stamps]) => [coin, [...stamps]]),
+    );
+    let body;
+    try {
+      body = await getJson(
+        `https://coins.llama.fi/batchHistorical?coins=${encodeURIComponent(JSON.stringify(batch))}` +
+          `&searchWidth=${SEARCH_WIDTH}`,
+      );
+    } catch {
+      continue; // those lots stay unpriced, which the report says out loud
+    }
+    for (const [coin, data] of Object.entries(body?.coins ?? {})) {
+      const points = data?.prices ?? [];
+      if (points.length === 0) continue;
+      for (const stamp of batch[coin] ?? []) {
+        let best = null;
+        for (const point of points) {
+          const gap = Math.abs(point.timestamp - stamp);
+          if (gap <= SEARCH_WIDTH && (best === null || gap < best.gap)) {
+            best = { gap, price: point.price, confidence: point.confidence ?? null };
+          }
+        }
+        if (best) {
+          out.set(historicalKey(coin, stamp), { price: best.price, confidence: best.confidence });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+const lookupHistorical = (prices, chainId, address, timestamp) =>
+  prices.get(historicalKey(coinId(chainId, address), timestamp)) ?? null;
 
 
 // ---- src/rpc.js ------------------------------------------------------
@@ -1795,6 +2211,12 @@ async function scanChain(client, chainId, user, poolIndex, { onProgress = () => 
 
   onProgress(`${chain.name}: reading balances`);
   const balanceRows = await client.getTokenBalances(chainId, user);
+
+  // ETH legs of swaps, which are not ERC-20 transfers and so are invisible to the
+  // sweep. Only cost basis needs them, and a client may not offer them at all.
+  const native = client.getNativeMoves
+    ? await client.getNativeMoves(chainId, user)
+    : { moves: new Map(), truncated: true };
   const balanceByToken = new Map(balanceRows.map((row) => [row.address, row]));
 
   // A reserve is a candidate if its aToken was ever transferred (covers closed
@@ -1946,6 +2368,10 @@ async function scanChain(client, chainId, user, poolIndex, { onProgress = () => 
     balanceRows,
     nativeRaw: await client.getNativeBalance(chainId, user),
     sweep: { truncated: sweep.truncated, pages: sweep.pages, transfers: sweep.transfers.length },
+    // Intermediates for the cost-basis pass in scanAddress, deleted before the
+    // result is returned: both are Maps and neither belongs in the payload.
+    transfers: sweep.transfers,
+    nativeMoves: native,
   };
 }
 
@@ -2062,11 +2488,127 @@ async function scanAddress(
       .sort((a, b) => (b.valueUsd ?? 0) - (a.valueUsd ?? 0));
     result.hiddenHoldings = result.holdings.filter((h) => !h.kept).length;
 
+    // Cost basis, from the wallet's own history: see src/basis.js. Only holdings
+    // that survived the spam filter are worth reconstructing, and the whole pass
+    // costs no explorer requests at all because the sweep already holds both legs
+    // of every swap.
+    const byTx = transactionDeltas(result.transfers ?? [], user);
+    for (const holding of result.holdings) {
+      if (!holding.kept) continue;
+      holding.lots = lotsForToken(byTx, holding.address, {
+        nativeDeltas: result.nativeMoves?.moves ?? new Map(),
+      });
+    }
+
     // balanceRows carries BigInts and is only an intermediate. Dropping it keeps
     // the payload JSON-serialisable and roughly halves the report size.
     delete result.balanceRows;
     result.nativeBalance = toUnits(result.nativeRaw, 18);
     delete result.nativeRaw;
+  }
+
+  // One batched historical-price call for every leg of every trade, across all
+  // chains at once. Paid legs give the cost of a lot, received legs the proceeds
+  // of a sale.
+  onProgress("pricing your trades");
+  const legRequests = [];
+  for (const result of results) {
+    for (const holding of result.holdings ?? []) {
+      if (!holding.lots) continue;
+      for (const lot of holding.lots.acquisitions) {
+        for (const leg of lot.paid) {
+          legRequests.push({ chainId: result.chainId, address: leg.token, timestamp: lot.timestamp });
+        }
+      }
+      for (const lot of holding.lots.disposals) {
+        for (const leg of lot.received) {
+          legRequests.push({ chainId: result.chainId, address: leg.token, timestamp: lot.timestamp });
+        }
+      }
+    }
+  }
+  let historical = new Map();
+  try {
+    historical = await fetchHistoricalPrices(legRequests);
+  } catch {
+    historical = new Map(); // every lot then reports an unknown basis, and says so
+  }
+
+  const valueLegs = (chainId, legs, timestamp) => {
+    let total = 0;
+    const priced = [];
+    for (const leg of legs) {
+      const info = lookupHistorical(historical, chainId, leg.token, timestamp);
+      const usd = info?.price != null ? leg.qty * info.price : null;
+      priced.push({ symbol: leg.symbol, qty: leg.qty, priceUsd: info?.price ?? null, valueUsd: usd });
+      if (usd == null) total = null;
+      else if (total != null) total += usd;
+    }
+    return { total: legs.length ? total : null, priced };
+  };
+
+  for (const result of results) {
+    for (const holding of result.holdings ?? []) {
+      const lots = holding.lots;
+      delete holding.lots;
+      if (!lots) continue;
+
+      const acquisitions = lots.acquisitions.map((lot) => {
+        const { total, priced } = valueLegs(result.chainId, lot.paid, lot.timestamp);
+        return { ...lot, paid: priced, costUsd: total };
+      });
+      const disposals = lots.disposals.map((lot) => {
+        const { total, priced } = valueLegs(result.chainId, lot.received, lot.timestamp);
+        return { ...lot, received: priced, proceedsUsd: total };
+      });
+
+      const { open, realized } = matchFifo(acquisitions, disposals);
+      const summary = summarise(open, {
+        balance: holding.amount,
+        priceUsd: holding.priceUsd,
+      });
+
+      // An acquisition with no counter-leg is an airdrop, a claim, an exchange
+      // withdrawal or your own other wallet. There can be hundreds of them on a
+      // token that pays holders, and listing each one would bury the trades that
+      // actually have a price, so they collapse into one line.
+      const trades = acquisitions.filter((a) => a.paid.length > 0);
+      const gifts = acquisitions.filter((a) => a.paid.length === 0);
+
+      holding.basis = {
+        ...summary,
+        // Cost basis can only be as complete as the sweep that fed it.
+        truncated: result.sweep.truncated || !!result.nativeMoves?.truncated,
+        trades: trades.map((t) => ({
+          timestamp: t.timestamp,
+          txHash: t.txHash,
+          qty: t.qty,
+          paid: t.paid,
+          costUsd: t.costUsd,
+          unitCostUsd: t.costUsd != null && t.qty > 0 ? t.costUsd / t.qty : null,
+        })),
+        received: gifts.length
+          ? {
+              count: gifts.length,
+              qty: gifts.reduce((sum, g) => sum + g.qty, 0),
+              firstTs: gifts[0].timestamp ?? null,
+              lastTs: gifts[gifts.length - 1].timestamp ?? null,
+            }
+          : null,
+        sales: realized.map((r) => ({
+          timestamp: r.timestamp,
+          txHash: r.txHash,
+          qty: r.qty,
+          received: r.received,
+          proceedsUsd: r.proceedsUsd,
+          costUsd: r.costUsd,
+          gainUsd: r.gainUsd,
+          unmatchedQty: r.unmatchedQty,
+        })),
+      };
+    }
+    delete result.transfers;
+    delete result.nativeMoves;
   }
 
   return {
@@ -2313,6 +2855,78 @@ async function getTokenTransfers(chainId, address, { maxPages = 60 } = {}) {
   return { transfers: merged, truncated: stillTruncated, pages };
 }
 
+/**
+ * Every transaction in which ETH itself moved in or out of the wallet.
+ *
+ * Cost basis reads a swap from the wallet's net position change, and a swap
+ * funded with ETH has no ERC-20 leg on the paying side, so without this an
+ * ETH-funded buy looks like a gift. Two paginated address endpoints cover it:
+ * `transactions` carries the value the wallet sent directly, and
+ * `internal-transactions` carries ETH a contract sent back, which is how a sale
+ * for ETH arrives.
+ *
+ * Paginated per ADDRESS rather than fetched per transaction. The per-transaction
+ * route is what the public instances rate-limit into the ground: a probe that
+ * fetched roughly a hundred single transactions took a 429 and stayed limited for
+ * minutes, while a paged address sweep of the same history is a handful of calls.
+ */
+async function getNativeMoves(chainId, address, { maxPages = 8 } = {}) {
+  const owner = address.toLowerCase();
+  const moves = new Map();
+  let truncated = false;
+
+  const walk = async (path, sign, fixed = {}) => {
+    let params = null;
+    for (let page = 0; ; page += 1) {
+      if (page >= maxPages) {
+        truncated = true;
+        return;
+      }
+      const query = new URLSearchParams(fixed);
+      for (const [key, value] of Object.entries(params ?? {})) {
+        if (value != null) query.set(key, String(value));
+      }
+      let body;
+      try {
+        body = await request(`${host(chainId)}/api/v2/addresses/${address}/${path}?${query}`);
+      } catch {
+        // Native legs are an enrichment: losing them costs cost-basis coverage on
+        // ETH-funded trades, which the report labels, and nothing else.
+        truncated = true;
+        return;
+      }
+      for (const item of body?.items ?? []) {
+        let raw;
+        try {
+          raw = BigInt(item.value ?? 0);
+        } catch {
+          continue;
+        }
+        if (raw === 0n) continue;
+        const hash = item.transaction_hash ?? item.hash;
+        if (!hash) continue;
+        const from = (item.from?.hash ?? "").toLowerCase();
+        const to = (item.to?.hash ?? "").toLowerCase();
+        // `sign` fixes the direction for the outgoing-transaction list, where the
+        // wallet is always the sender; internal rows are read from their own ends.
+        let delta = 0n;
+        if (sign !== 0) delta = raw * BigInt(sign);
+        else if (to === owner && from !== owner) delta = raw;
+        else if (from === owner && to !== owner) delta = -raw;
+        if (delta === 0n) continue;
+        moves.set(hash, (moves.get(hash) ?? 0n) + delta);
+      }
+      if (!body?.next_page_params) return;
+      params = body.next_page_params;
+    }
+  };
+
+  // filter=from is the wallet's own sends, so every row is ETH leaving.
+  await walk("transactions", -1, { filter: "from" });
+  await walk("internal-transactions", 0);
+  return { moves, truncated };
+}
+
 async function getNativeBalance(chainId, address) {
   const body = await request(`${host(chainId)}/api/v2/addresses/${address}`);
   return BigInt(body?.coin_balance ?? 0);
@@ -2354,6 +2968,7 @@ const webClient = {
   getPositionLogs,
   getTokenBalances,
   getTokenTransfers,
+  getNativeMoves,
   getNativeBalance,
   reservesFor,
   requestCount: () => requests,

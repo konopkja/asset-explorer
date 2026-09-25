@@ -26,7 +26,7 @@ instances serve `access-control-allow-origin: *`, which allows a null origin.
 
 ```bash
 npm run dev    # build, then serve web/ on http://localhost:8931
-npm test       # 17 known-answer tests, incl. Microsoft's documented XIRR example
+npm test       # 27 known-answer tests, incl. Microsoft's documented XIRR example
 ```
 
 ## Deploy
@@ -72,6 +72,35 @@ while displaying a balance of 0. Anything worth **under a cent** therefore count
 and lands in the strip. `isOpen` in the payload stays a fact about the chain; the dust
 judgement is a separate `isDust` flag.
 
+## What you paid for what you hold
+
+The scan already sweeps every ERC-20 transfer the wallet ever made, and that is
+enough to reconstruct cost basis with **no extra explorer requests at all**. A swap,
+whoever routed it, is one transaction in which your balance of one token falls and
+another rises, so the trade is read from your net position change per transaction:
+whatever left the wallet is what you paid. No DEX adapters, no router allow-list —
+it works the same for Uniswap, CoW, an aggregator or a contract nobody has decoded.
+
+Each priced holding gets a cost, a break-even price and a profit or loss, plus an
+expandable history of every buy and sale with the other side of each trade named.
+
+- **ETH legs** are not ERC-20 transfers, so they come from two extra paginated
+  address endpoints per chain (`transactions?filter=from` and
+  `internal-transactions`). Paginated per address, never per transaction: a probe
+  that fetched ~100 single transactions took a 429 from the public instance and
+  stayed limited for minutes, while the paged sweep of the same history is a
+  handful of calls.
+- **Prices** come from one `batchHistorical` call for every leg of every trade
+  across all chains at once, rather than one call per trade date.
+- **Tokens that arrived with nothing on the other side** — an airdrop, a claim, an
+  exchange withdrawal, your own second wallet — have no onchain cost. They are
+  counted as quantity with an UNKNOWN basis, never as free profit, because the
+  chain cannot tell a genuine airdrop from something you bought elsewhere. Selling
+  one realises no stated gain rather than booking the whole proceeds.
+- **FIFO**, oldest lot first, so every remaining lot stays traceable to the
+  transaction that created it.
+- **Gas is not included**, so a break-even price is slightly optimistic.
+
 ## How it works
 
 One primitive, read many ways: a dated cashflow ledger per position.
@@ -90,6 +119,7 @@ render        one renderer -> the live page, or a standalone dark HTML file
 ```
 src/
   chains.js      5 chains: explorer APIs, market instances, DefiLlama's names
+  basis.js       trades from net position change, FIFO lots, cost basis
   decode.js      zero-dep aToken event decoding, pinned topic hashes
   ledger.js      events -> classified, dated principal/interest ledger
   metrics.js     XIRR, pool TWR, utilisation, exact balance series
@@ -224,7 +254,9 @@ that looked exactly like a missing event.
 
 ## Verified
 
-- 17 known-answer tests, including Microsoft's documented XIRR example to 1e-6.
+- 27 known-answer tests, including Microsoft's documented XIRR example to 1e-6, and
+  FIFO cases covering partial sales, airdrops, ETH-funded buys and selling more than
+  the history accounts for.
 - Both accounting identities close on a real leveraged mainnet address:
   `balance − netPrincipal == interest`, and `realised + pending == interest`.
 - Linea, scanned in a browser against a real address: 2 positions, both reconciled, dated

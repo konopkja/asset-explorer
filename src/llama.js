@@ -1,4 +1,4 @@
-import { CHAINS } from "./chains.js";
+import { CHAINS, NATIVE_COIN } from "./chains.js";
 
 const HEADERS = { "User-Agent": "curl/8.7.1", Accept: "application/json" };
 
@@ -129,3 +129,76 @@ export async function fetchPrices(tokens) {
 
 export const lookupPrice = (prices, chainId, address) =>
   prices.get(priceKey(chainId, address).toLowerCase()) ?? null;
+
+/**
+ * Historical prices for many (token, moment) pairs in ONE request.
+ *
+ * Cost basis needs a price at the moment of every trade, and the obvious
+ * endpoint (`prices/historical/{ts}/{coins}`) takes one timestamp, so a wallet
+ * with forty trades on forty days would pay forty round trips. `batchHistorical`
+ * takes a map of coin -> list of timestamps instead, which collapses the whole
+ * report into a single call.
+ *
+ * DefiLlama answers with the nearest price it has rather than the exact instant,
+ * so the reply is matched back by proximity and anything outside the search
+ * window is dropped rather than snapped to a distant price.
+ */
+const SEARCH_WIDTH = 600; // seconds either side, matching the endpoint's default
+
+export const historicalKey = (coin, timestamp) => `${coin.toLowerCase()}@${timestamp}`;
+
+/** `address: null` means the chain's native coin. */
+export const coinId = (chainId, address) => {
+  if (address == null) return NATIVE_COIN;
+  const chain = CHAINS.find((c) => c.id === chainId);
+  return `${chain?.llamaPrice ?? "ethereum"}:${address.toLowerCase()}`;
+};
+
+export async function fetchHistoricalPrices(requests) {
+  const wanted = new Map(); // coin -> Set of timestamps
+  for (const r of requests) {
+    if (r.timestamp == null) continue;
+    const coin = coinId(r.chainId, r.address);
+    if (!wanted.has(coin)) wanted.set(coin, new Set());
+    wanted.get(coin).add(r.timestamp);
+  }
+  const out = new Map();
+  if (wanted.size === 0) return out;
+
+  // Chunked so one enormous URL cannot fail the whole report.
+  const coins = [...wanted.entries()];
+  for (let i = 0; i < coins.length; i += 25) {
+    const batch = Object.fromEntries(
+      coins.slice(i, i + 25).map(([coin, stamps]) => [coin, [...stamps]]),
+    );
+    let body;
+    try {
+      body = await getJson(
+        `https://coins.llama.fi/batchHistorical?coins=${encodeURIComponent(JSON.stringify(batch))}` +
+          `&searchWidth=${SEARCH_WIDTH}`,
+      );
+    } catch {
+      continue; // those lots stay unpriced, which the report says out loud
+    }
+    for (const [coin, data] of Object.entries(body?.coins ?? {})) {
+      const points = data?.prices ?? [];
+      if (points.length === 0) continue;
+      for (const stamp of batch[coin] ?? []) {
+        let best = null;
+        for (const point of points) {
+          const gap = Math.abs(point.timestamp - stamp);
+          if (gap <= SEARCH_WIDTH && (best === null || gap < best.gap)) {
+            best = { gap, price: point.price, confidence: point.confidence ?? null };
+          }
+        }
+        if (best) {
+          out.set(historicalKey(coin, stamp), { price: best.price, confidence: best.confidence });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+export const lookupHistorical = (prices, chainId, address, timestamp) =>
+  prices.get(historicalKey(coinId(chainId, address), timestamp)) ?? null;
