@@ -135,6 +135,24 @@ export async function scanChain(client, chainId, user, poolIndex, { onProgress =
     scaledBalanceOfBatch(chainId, aTokens, user),
   ]);
 
+  // Which tokens did this wallet actually trade? Computed here because it costs
+  // nothing (the sweep is already in hand) and because scanAddress needs it
+  // before the price call, so a token that was bought and then sold to zero can
+  // still be priced and reported.
+  const byTx = transactionDeltas(sweep.transfers, user);
+  const tradedTokens = [];
+  {
+    const seen = new Map();
+    for (const tx of byTx.values()) {
+      const moved = [...tx.deltas.values()].filter((d) => d.raw !== 0n);
+      if (moved.length < 2) continue; // nothing was exchanged for anything
+      for (const d of moved) {
+        if (!seen.has(d.token)) seen.set(d.token, { address: d.token, symbol: d.symbol, decimals: d.decimals });
+      }
+    }
+    tradedTokens.push(...seen.values());
+  }
+
   const positions = [];
   for (const reserve of candidates) {
     onProgress(`${chain.name}: ${reserve.symbol}`);
@@ -265,6 +283,7 @@ export async function scanChain(client, chainId, user, poolIndex, { onProgress =
     // result is returned: both are Maps and neither belongs in the payload.
     transfers: sweep.transfers,
     nativeMoves: native,
+    tradedTokens,
   };
 }
 
@@ -305,6 +324,9 @@ export async function scanAddress(
     }
     for (const position of result.positions) {
       priceTargets.push({ chainId: result.chainId, address: position.underlying });
+    }
+    for (const traded of result.tradedTokens ?? []) {
+      priceTargets.push({ chainId: result.chainId, address: traded.address });
     }
   }
   let prices = new Map();
@@ -359,6 +381,8 @@ export async function scanAddress(
       })
       .filter((d) => d.amount > 0);
 
+    const tradedAddresses = new Set((result.tradedTokens ?? []).map((t) => t.address));
+
     result.holdings = result.balanceRows
       .filter((row) => !aTokens.has(row.address) && !debtTokens.has(row.address))
       .map((row) => {
@@ -379,6 +403,41 @@ export async function scanAddress(
         };
       })
       .sort((a, b) => (b.valueUsd ?? 0) - (a.valueUsd ?? 0));
+    // A token you BOUGHT belongs in the report whatever it is worth now. The $1
+    // floor exists to bury airdropped spam, and it was also burying a real trade:
+    // 4.33 USDC of a token now worth one cent is a 99.8% loss, which is exactly
+    // the thing the holder wants to know. Trading it is the signal spam cannot
+    // fake, so it overrides the floor -- but never the scam veto.
+    const heldAddresses = new Set(result.holdings.map((h) => h.address));
+    for (const holding of result.holdings) {
+      if (!holding.kept && tradedAddresses.has(holding.address) && holding.reputation !== "scam") {
+        holding.kept = true;
+        holding.keptBecauseTraded = true;
+      }
+    }
+
+    // ...and a token bought and then sold down to nothing has no balance row at
+    // all, so it would vanish entirely along with its realised profit or loss.
+    for (const traded of result.tradedTokens ?? []) {
+      if (heldAddresses.has(traded.address)) continue;
+      if (aTokens.has(traded.address) || debtTokens.has(traded.address)) continue;
+      const info = lookupPrice(prices, result.chainId, traded.address);
+      result.holdings.push({
+        symbol: traded.symbol,
+        name: null,
+        address: traded.address,
+        decimals: traded.decimals,
+        reputation: null,
+        amount: 0,
+        priceUsd: info?.price ?? null,
+        valueUsd: 0,
+        confidence: info?.confidence ?? null,
+        kept: true,
+        keptBecauseTraded: true,
+        exited: true,
+      });
+    }
+
     result.hiddenHoldings = result.holdings.filter((h) => !h.kept).length;
 
     // Cost basis, from the wallet's own history: see src/basis.js. Only holdings
@@ -456,6 +515,16 @@ export async function scanAddress(
       });
 
       const { open, realized } = matchFifo(acquisitions, disposals);
+      // Realised result, which is the whole story for a token sold down to zero
+      // and half of it for one partly sold. Proceeds are reported even when the
+      // cost is unknown, because "sold for $21.88, cost unknown" is useful and
+      // "no data" is not.
+      const proceedsUsd = realized.length && realized.every((r) => r.proceedsUsd != null)
+        ? realized.reduce((sum, r) => sum + r.proceedsUsd, 0)
+        : null;
+      const realizedGainUsd = realized.length && realized.every((r) => r.gainUsd != null)
+        ? realized.reduce((sum, r) => sum + r.gainUsd, 0)
+        : null;
       const summary = summarise(open, {
         balance: holding.amount,
         priceUsd: holding.priceUsd,
@@ -470,6 +539,8 @@ export async function scanAddress(
 
       holding.basis = {
         ...summary,
+        proceedsUsd,
+        realizedGainUsd,
         // Cost basis can only be as complete as the sweep that fed it.
         truncated: result.sweep.truncated || !!result.nativeMoves?.truncated,
         trades: trades.map((t) => ({
@@ -500,6 +571,23 @@ export async function scanAddress(
         })),
       };
     }
+    // Trading a token is a strong signal it is not spam, but on its own it lets in
+    // two kinds of noise, both visible on a real wallet:
+    //
+    //   - The unit of account. Every swap has USDC on one side, so USDC looks like
+    //     something bought 12 times and sold 20 times. Its cost basis is its face
+    //     value and the line says nothing. Detected from the price rather than a
+    //     hardcoded list, so a depegged stable still shows.
+    //   - Trades too small to matter: a spam token received and dumped for 31
+    //     cents is still spam.
+    result.holdings = result.holdings.filter((holding) => {
+      if (!holding.keptBecauseTraded) return true;
+      if (holding.priceUsd != null && Math.abs(holding.priceUsd - 1) < 0.01) return false;
+      const traded = (holding.basis?.costUsd ?? 0) + (holding.basis?.proceedsUsd ?? 0);
+      return traded >= 1;
+    });
+    result.hiddenHoldings = result.holdings.filter((h) => !h.kept).length;
+
     delete result.transfers;
     delete result.nativeMoves;
   }

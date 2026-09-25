@@ -592,7 +592,8 @@ export const RENDER_SCRIPT = String.raw`
     const sum = el("div", "card");
     sum.appendChild(el("div", "chart-title", "Priced above $1, by chain"));
     sum.appendChild(el("div", "chart-note",
-      "Total " + usd(grand) + ". " +
+      "Total " + usd(grand) + ", plus any token you traded yourself, which is listed " +
+      "whatever it is worth now. " +
       totals.reduce((s, t) => s + t.hidden, 0) + " entries excluded as spam, dust or unpriced." +
       (totals.some(t => t.truncated) ? " History was truncated on at least one chain, so this is incomplete." : "")));
 
@@ -674,11 +675,18 @@ export const RENDER_SCRIPT = String.raw`
 
     const card = el("div", "card");
     card.appendChild(el("div", "chart-title", "What you paid for what you hold"));
+    const banked = rows.filter(h => h.basis.realizedGainUsd != null)
+      .reduce((s, h) => s + h.basis.realizedGainUsd, 0);
+    const bankedCount = rows.filter(h => h.basis.realizedGainUsd != null).length;
     card.appendChild(el("div", "chart-note",
       (known.length
         ? "Across " + known.length + " token" + (known.length === 1 ? "" : "s") +
-          " with a reconstructed basis: " + usd(cost) + " paid, worth " + usd(cost + gain) +
-          " now, " + (gain >= 0 ? "up " : "down ") + usd(Math.abs(gain)) + ". "
+          " you still hold with a reconstructed basis: " + usd(cost) + " paid, worth " +
+          usd(cost + gain) + " now, " + (gain >= 0 ? "up " : "down ") + usd(Math.abs(gain)) + ". "
+        : "") +
+      (bankedCount
+        ? "Sales already made are " + (banked >= 0 ? "up " : "down ") + usd(Math.abs(banked)) +
+          " on what those lots cost. "
         : "") +
       "Read from your own transfers: in each transaction, whatever left the wallet is what " +
       "you paid for whatever arrived. Gas is not included, so break-even is slightly optimistic." +
@@ -693,16 +701,28 @@ export const RENDER_SCRIPT = String.raw`
       const det = el("details");
       const bits = [];
       if ((b.trades || []).length) bits.push(b.trades.length + (b.trades.length === 1 ? " buy" : " buys"));
-      if ((b.sales || []).length) bits.push(b.sales.length + (b.sales.length === 1 ? " sale" : " sales"));
+      if ((b.sales || []).length) {
+        bits.push(b.sales.length + (b.sales.length === 1 ? " sale" : " sales") +
+          (b.proceedsUsd != null ? " for " + usd(b.proceedsUsd) : ""));
+      }
       // The count, not a quantity: the summary sits next to "2 buys" and a
       // quantity there reads as the amount still held, which it is not.
       if (b.received) bits.push(b.received.count + (b.received.count === 1 ? " receipt" : " receipts"));
+      // Two different answers, never added together: what the tokens you still
+      // hold are up or down, and what you actually banked on the ones you sold.
+      const verdict = [];
+      if (b.gainUsd != null) {
+        verdict.push('<span class="' + (b.gainUsd >= 0 ? "pos" : "neg") + '">' +
+          (b.gainUsd >= 0 ? "+" : "") + usd(b.gainUsd) + "</span> holding");
+      }
+      if (b.realizedGainUsd != null) {
+        verdict.push('<span class="' + (b.realizedGainUsd >= 0 ? "pos" : "neg") + '">' +
+          (b.realizedGainUsd >= 0 ? "+" : "") + usd(b.realizedGainUsd) + "</span> realised");
+      }
+      if (verdict.length === 0) verdict.push("cost unknown");
       det.appendChild(el("summary", null,
-        h.symbol + " on " + h.chain + " &middot; " + bits.join(", ") +
-        (b.gainUsd != null
-          ? ' &middot; <span class="' + (b.gainUsd >= 0 ? "pos" : "neg") + '">' +
-            (b.gainUsd >= 0 ? "+" : "") + usd(b.gainUsd) + "</span>"
-          : " &middot; cost unknown")));
+        h.symbol + " on " + h.chain + (h.exited ? " (sold out)" : "") +
+        " &middot; " + bits.join(", ") + " &middot; " + verdict.join(", ")));
 
       const scroll = el("div", "scroll");
       const lines = [];

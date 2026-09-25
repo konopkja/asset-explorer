@@ -100,6 +100,16 @@ expandable history of every buy and sale with the other side of each trade named
 - **FIFO**, oldest lot first, so every remaining lot stays traceable to the
   transaction that created it.
 - **Gas is not included**, so a break-even price is slightly optimistic.
+- **A token you traded is listed whatever it is worth now**, overriding the $1
+  dust floor that buries airdropped spam, because 4.33 USDC of a token now worth
+  one cent is a 99.8% loss and that is the answer the holder wants. A token bought
+  and then sold to zero has no balance row at all, so it is added back from the
+  sweep with its realised result. Two filters keep that from turning into noise:
+  the unit of account is dropped (every swap has USDC on one side, which would
+  otherwise read as a token bought 12 times and sold 20 times — detected from the
+  price sitting within 1% of a dollar, not from a hardcoded list, so a depegged
+  stable still shows), and so is any token whose whole trading history is worth
+  under a dollar.
 
 ## How it works
 
